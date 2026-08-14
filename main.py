@@ -134,9 +134,9 @@ class STTNode:
 
 
 class LLMNode:
-    """Translate Vietnamese text into English with Groq API (openai/gpt-oss-20b)."""
+    """Translate Vietnamese text into English with Groq API (llama-3.3-70b-versatile)."""
 
-    def __init__(self, model_name: str = "openai/gpt-oss-20b") -> None:
+    def __init__(self, model_name: str = "llama-3.3-70b-versatile") -> None:
         self.model_name = model_name
         self.client = None
         self.api_key_missing = False
@@ -186,7 +186,7 @@ class LLMNode:
                 ],
                 model=self.model_name,
                 temperature=0.0,
-                max_tokens=256,
+                max_tokens=300,
             )
             result = message.choices[0].message.content.strip() if message.choices else ""
             if not result:
@@ -446,7 +446,7 @@ def build_ui() -> gr.Blocks:
                 
                 ### 🔧 Công Nghệ
                 - **STT**: faster-whisper (Model: large-v3-turbo)
-                - **LLM**: Groq LLM (Model: openai/gpt-oss-20b)
+                - **LLM**: Groq LLM (Model: llama-3.3-70b-versatile)
                 - **TTS**: edge-tts (fallback) / Vienew (tùy chọn)
                 - **GUI**: Gradio
                 
@@ -472,7 +472,7 @@ def build_ui() -> gr.Blocks:
                 
                 ### 🔑 API Key
                 - **Status**: ✅ Đã cấu hình
-                - **Model**: openai/gpt-oss-20b
+                - **Model**: llama-3.3-70b-versatile
                 - **Tệp**: `.env` (giữ bảo mật)
                 
                 ### 🖥️ GPU
