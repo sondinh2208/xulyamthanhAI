@@ -1,0 +1,7 @@
+# Bỏ qua môi trường ảo và rác hệ thống
+.venv/
+__pycache__/
+.vscode/
+
+# BỎ QUA FILE CHỨA API KEY (Cực kỳ quan trọng)
+.env
