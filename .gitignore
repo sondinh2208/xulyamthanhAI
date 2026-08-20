@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 .vscode/
+.gradio/
 
 # BỎ QUA FILE CHỨA API KEY (Cực kỳ quan trọng)
 .env

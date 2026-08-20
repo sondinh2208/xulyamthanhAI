@@ -69,9 +69,28 @@ class AudioInputNode:
         return buffer.getvalue(), self.sample_rate
 
 
+def _default_whisper_model() -> str:
+    """Pick a Whisper size that fits the runtime (HF free Spaces = CPU)."""
+    override = os.getenv("WHISPER_MODEL")
+    if override:
+        return override
+    # Hugging Face Spaces sets SPACE_ID; free tier is CPU-only and slow for large models.
+    if os.getenv("SPACE_ID") or os.getenv("SYSTEM") == "spaces":
+        return "small"
+    if importlib.util.find_spec("torch") is not None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "large-v3-turbo"
+        except Exception:
+            pass
+    return "small"
+
+
 class STTNode:
-    def __init__(self, model_name: str = "large-v3-turbo"):
-        self.model_name = model_name
+    def __init__(self, model_name: Optional[str] = None):
+        self.model_name = model_name or _default_whisper_model()
         self.device = "cuda" if self._cuda_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
         print(f"[STT] Using {self.device.upper()} ({self.compute_type})")
@@ -454,15 +473,17 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+demo = build_ui()
+
+
 if __name__ == "__main__":
-    demo = build_ui()
-    port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", port))
-    except OSError:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-    print(f"Open your browser at: http://127.0.0.1:{port}")
-    demo.launch(server_name="127.0.0.1", server_port=port, share=False)
+    port = int(os.environ.get("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
+    # HF Spaces already exposes a public URL — do not use Gradio share tunnels there.
+    on_spaces = bool(os.getenv("SPACE_ID") or os.getenv("SYSTEM") == "spaces")
+    # Local default: public Gradio share so the app is reachable on the web without HF PRO.
+    share_env = os.getenv("GRADIO_SHARE", "true" if not on_spaces else "false").lower()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=(not on_spaces) and share_env in {"1", "true", "yes"},
+    )
