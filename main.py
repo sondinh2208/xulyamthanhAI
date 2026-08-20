@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import io
 import os
+import re
 import tempfile
 import time
 import socket
@@ -134,13 +135,15 @@ class STTNode:
 
 
 class LLMNode:
-    """Translate Vietnamese text into English with Groq API (llama-3.3-70b-versatile)."""
+    """Translate Vietnamese text into English with Groq API (openai/gpt-oss-20b)."""
 
-    def __init__(self, model_name: str = "llama-3.3-70b-versatile") -> None:
+    def __init__(self, model_name: str = "openai/gpt-oss-20b") -> None:
         self.model_name = model_name
         self.client = None
         self.api_key_missing = False
         self._load_model()
+
+
 
     def _load_model(self) -> None:
         if importlib.util.find_spec("groq") is None:
@@ -172,26 +175,133 @@ class LLMNode:
         if self.client is None:
             return f"[ERROR] LLM client not loaded. Check console output above."
 
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return "[ERROR] No text to translate."
+
+        # Long transcripts: translate in chunks so output never hits the token ceiling.
+        chunks = self._split_for_translation(cleaned)
+        if len(chunks) == 1:
+            return self._translate_chunk(chunks[0])
+
+        parts: list[str] = []
+        for i, chunk in enumerate(chunks, start=1):
+            print(f"[LLM] Translating chunk {i}/{len(chunks)} ({len(chunk)} chars)...")
+            part = self._translate_chunk(chunk)
+            if part.startswith("[ERROR]"):
+                return part
+            parts.append(part)
+        return " ".join(parts).strip()
+
+    def _split_for_translation(self, text: str, max_chars: int = 1200) -> list[str]:
+        """Split long Vietnamese text into sentence-ish chunks for stable translation."""
+        if len(text) <= max_chars:
+            return [text]
+
+        # Prefer sentence boundaries; fall back to commas/newlines (common in VI transcripts).
+        sentences = re.split(r"(?<=[.!?…])\s+|(?<=[;])\s+|\n+", text)
+        if len(sentences) == 1 and len(text) > max_chars:
+            sentences = re.split(r"(?<=[,])\s+", text)
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if not current:
+                current = sentence
+            elif len(current) + 1 + len(sentence) <= max_chars:
+                current = f"{current} {sentence}"
+            else:
+                chunks.append(current)
+                current = sentence
+        if current:
+            chunks.append(current)
+
+        # Hard-split any oversized leftover piece.
+        final: list[str] = []
+        for chunk in chunks:
+            if len(chunk) <= max_chars:
+                final.append(chunk)
+                continue
+            words = chunk.split()
+            buf: list[str] = []
+            size = 0
+            for word in words:
+                add = len(word) + (1 if buf else 0)
+                if buf and size + add > max_chars:
+                    final.append(" ".join(buf))
+                    buf = [word]
+                    size = len(word)
+                else:
+                    buf.append(word)
+                    size += add
+            if buf:
+                final.append(" ".join(buf))
+        return final or [text]
+
+    def _translate_chunk(self, text: str) -> str:
         prompt = (
-            "You are a professional translator. Translate the following Vietnamese text to English. "
-            "Output ONLY the English text, no explanations, no markdown.\n\n"
+            "Translate the following Vietnamese text to English. "
+            "Output ONLY the English translation — no explanations, no markdown, no quotes.\n\n"
             f"{text}"
         )
+
+        # gpt-oss-20b is a reasoning model: reasoning tokens share the same completion budget.
+        # Long text + low max_tokens => empty content with finish_reason=length.
+        approx_out = max(256, min(4096, int(len(text.split()) * 3) + 256))
+        max_completion_tokens = approx_out + 1024  # headroom for reasoning
 
         try:
             message = self.client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "You are a professional Vietnamese to English translator. Output ONLY the translated text."},
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a professional Vietnamese to English translator. "
+                            "Output ONLY the translated English text."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
                 ],
                 model=self.model_name,
                 temperature=0.0,
-                max_tokens=300,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_effort="low",
             )
-            result = message.choices[0].message.content.strip() if message.choices else ""
-            if not result:
-                return f"[ERROR] Empty translation response from Groq."
-            return result
+            choice = message.choices[0] if message.choices else None
+            content = (choice.message.content or "").strip() if choice else ""
+            finish_reason = getattr(choice, "finish_reason", None) if choice else None
+
+            if not content:
+                # Retry once with a larger budget if reasoning ate the first budget.
+                if finish_reason == "length":
+                    print("[LLM] Empty content (reasoning used budget). Retrying with higher limit...")
+                    message = self.client.chat.completions.create(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a professional Vietnamese to English translator. "
+                                    "Output ONLY the translated English text."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        model=self.model_name,
+                        temperature=0.0,
+                        max_completion_tokens=min(8192, max_completion_tokens * 2),
+                        reasoning_effort="low",
+                    )
+                    choice = message.choices[0] if message.choices else None
+                    content = (choice.message.content or "").strip() if choice else ""
+
+            if not content:
+                return (
+                    "[ERROR] Empty translation response from Groq "
+                    f"(finish_reason={finish_reason}). Try a shorter clip or check API limits."
+                )
+            return content
         except Exception as exc:  # pragma: no cover - defensive fallback
             print(f"[LLM] Translation failed: {exc}")
             return f"[ERROR] Translation failed: {str(exc)}"
@@ -272,7 +382,7 @@ class SpeechTranslationPipeline:
         self.llm_node = LLMNode()
         self.tts_node = VienewTTSWrapper()
 
-    def run(self, audio_path: Optional[str]) -> Tuple[str, str, str, str]:
+    def run(self, audio_path: Optional[str]) -> Tuple[str, str, Optional[str], str]:
         start_time = time.perf_counter()
         print("[PIPELINE] Starting...")
 
@@ -289,7 +399,9 @@ class SpeechTranslationPipeline:
         except Exception as exc:  # pragma: no cover - defensive fallback
             elapsed = time.perf_counter() - start_time
             print(f"[PIPELINE] Failed after {elapsed:.2f}s: {exc}")
-            return "", f"[Pipeline error] {exc}", "", f"Failed: {exc}"
+            return "", f"[Pipeline error] {exc}", None, f"Failed: {exc}"
+
+
 
     def _step(self, step_name: str, action) -> object:
         start = time.perf_counter()
@@ -310,189 +422,297 @@ def build_ui() -> gr.Blocks:
 
     def translate_audio(audio_path: Optional[str]):
         if not audio_path:
-            return "", "", None, "Please record audio first."
+            return "", "", None, "⚠️ Vui lòng ghi âm hoặc tải tệp âm thanh trước!"
 
         transcript, translation, audio_output_path, status = pipeline.run(audio_path)
         return transcript, translation, audio_output_path, status
 
     custom_css = """
-    .header-title {
+    /* ===== Global ===== */
+    :root {
+        --gradient-primary: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+        --glass-bg: rgba(255, 255, 255, 0.08);
+        --glass-border: rgba(255, 255, 255, 0.15);
+        --text-primary: #f8fafc;
+        --text-secondary: #94a3b8;
+        --accent: #8b5cf6;
+    }
+
+    .gradio-container {
+        background: radial-gradient(ellipse at top, #1e1b4b 0%, #0f172a 45%, #020617 100%) !important;
+        font-family: 'Inter', system-ui, sans-serif !important;
+    }
+
+    /* ===== Hero Header ===== */
+    .hero-section {
         text-align: center;
-        font-size: 2.5em;
+        padding: 40px 20px 10px;
+        position: relative;
+    }
+
+    .hero-title {
+        font-size: 3em;
         font-weight: 800;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, #a78bfa 0%, #60a5fa 50%, #22d3ee 100%);
+        background-size: 200% 200%;
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        padding: 20px 0;
-        margin-bottom: 10px;
+        background-clip: text;
+        margin: 0 0 8px;
+        letter-spacing: -1px;
+        animation: gradient-shift 6s ease infinite;
     }
-    
-    .header-subtitle {
-        text-align: center;
+
+    @keyframes gradient-shift {
+        0%, 100% { background-position: 0% 50%; }
+        50% { background-position: 100% 50%; }
+    }
+
+    .hero-subtitle {
+        color: var(--text-secondary);
+        font-size: 1.15em;
+        margin: 0 0 20px;
+    }
+
+    .hero-subtitle .flag {
+        font-size: 1.3em;
+    }
+
+    /* ===== Glass Cards ===== */
+    .glass-card {
+        background: var(--glass-bg);
+        border: 1px solid var(--glass-border);
+        border-radius: 16px;
+        padding: 16px 20px;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+        transition: all 0.3s ease;
+        margin-bottom: 12px;
+    }
+
+    .glass-card:hover {
+        border-color: rgba(139, 92, 246, 0.4);
+        box-shadow: 0 12px 40px rgba(139, 92, 246, 0.12);
+    }
+
+    .card-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 1.05em;
+        font-weight: 700;
+        color: var(--text-primary);
+    }
+
+    .card-title .card-icon {
+        width: 36px;
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 10px;
+        background: linear-gradient(135deg, rgba(139, 92, 246, 0.3), rgba(6, 182, 212, 0.3));
         font-size: 1.1em;
-        color: #666;
-        margin-bottom: 30px;
     }
-    
-    .info-box {
-        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
-        border-left: 4px solid #667eea;
-        padding: 15px;
-        border-radius: 8px;
-        margin: 15px 0;
+
+    /* ===== Buttons ===== */
+    .translate-btn {
+        background: var(--gradient-primary) !important;
+        border: none !important;
+        color: white !important;
+        font-weight: 700 !important;
+        font-size: 1.1em !important;
+        padding: 14px 32px !important;
+        border-radius: 14px !important;
+        box-shadow: 0 4px 20px rgba(139, 92, 246, 0.35) !important;
+        transition: all 0.3s ease !important;
+        letter-spacing: 0.3px;
     }
-    
-    .status-success {
-        color: #22c55e;
-        font-weight: 600;
+
+    .translate-btn:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 8px 32px rgba(139, 92, 246, 0.5) !important;
+        filter: brightness(1.1);
     }
-    
-    .status-error {
-        color: #ef4444;
-        font-weight: 600;
+
+    .translate-btn:active {
+        transform: translateY(0) !important;
     }
-    
-    .card-section {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-        padding: 20px;
-        border-radius: 12px;
-        margin: 15px 0;
+
+    /* ===== Textboxes ===== */
+    .textbox-output textarea {
+        background: rgba(15, 23, 42, 0.6) !important;
+        border: 1px solid var(--glass-border) !important;
+        border-radius: 12px !important;
+        color: var(--text-primary) !important;
+        font-size: 1em !important;
+        line-height: 1.6 !important;
+    }
+
+    .textbox-output textarea:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15) !important;
+    }
+
+    /* ===== Audio ===== */
+    .audio-input, .audio-output {
+        border-radius: 12px !important;
+        overflow: hidden;
+    }
+
+    /* ===== Scrollbar ===== */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+        background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+        background: rgba(139, 92, 246, 0.4);
+        border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+        background: rgba(139, 92, 246, 0.6);
+    }
+
+    /* ===== Footer ===== */
+    .footer {
+        text-align: center;
+        color: var(--text-secondary);
+        font-size: 0.85em;
+        padding: 20px 0 10px;
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        margin-top: 30px;
+    }
+
+    .footer .heart {
+        color: #f472b6;
     }
     """
 
-    with gr.Blocks(title="Vietnamese Speech -> English Speech Translator", css=custom_css, theme=gr.themes.Soft()) as demo:
-        # Header
-        gr.HTML("<div class='header-title'>🌐 Speech Translation Pipeline</div>")
-        gr.HTML("<div class='header-subtitle'>Vietnamese 🇻🇳 → English 🇬🇧 in Real-time</div>")
-        
-        # Info Box
+    theme = gr.themes.Base(
+        primary_hue=gr.themes.colors.purple,
+        secondary_hue=gr.themes.colors.blue,
+        neutral_hue=gr.themes.colors.slate,
+        font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
+        font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "monospace"],
+    )
+
+    with gr.Blocks(title="Dịch Giọng Nói Việt - Anh", css=custom_css, theme=theme) as demo:
+        # ===== Hero Section =====
         gr.HTML("""
-        <div class='info-box'>
-            <b>📌 Hướng dẫn:</b> Nhấn nút ghi âm, nói tiếng Việt, sau đó nhấn "Dịch & Phát âm". 
-            Hệ thống sẽ tự động dịch sang tiếng Anh và phát âm cho bạn.
+        <div class='hero-section'>
+            <h1 class='hero-title'>Dịch Giọng Nói</h1>
+            <p class='hero-subtitle'>
+                <span class='flag'>🇻🇳</span> Tiếng Việt
+                <span style='color:#8b5cf6; font-weight:700;'>→</span>
+                <span class='flag'>🇬🇧</span> English
+            </p>
         </div>
         """)
 
-        with gr.Tabs():
-            # Tab 1: Main Translation
-            with gr.TabItem("🎤 Dịch Nhanh", id="tab_translate"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("### 🎙️ Input: Tiếng Việt")
-                        audio_input = gr.Audio(
-                            label="Ghi âm hoặc tải tệp",
-                            sources=["microphone", "upload"],
-                            type="filepath",
-                            streaming=False,
-                        )
-                    
-                    with gr.Column(scale=1):
-                        gr.Markdown("### 🔊 Output: Tiếng Anh")
-                        audio_output = gr.Audio(
-                            label="Phát âm tiếng Anh",
-                            type="filepath",
-                            interactive=False
-                        )
+        # ===== Main Translation =====
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.HTML("""
+                <div class='glass-card'>
+                    <div class='card-title'>
+                        <span class='card-icon'>🎙️</span>
+                        Input: Tiếng Việt
+                    </div>
+                </div>
+                """)
+                audio_input = gr.Audio(
+                    label="Ghi âm hoặc tải tệp",
+                    sources=["microphone", "upload"],
+                    type="filepath",
+                    streaming=False,
+                    elem_classes=["audio-input"],
+                )
 
-                with gr.Row():
-                    translate_button = gr.Button("🚀 Dịch & Phát Âm", size="lg", variant="primary")
-
-                # Status
-                status_box = gr.Textbox(
-                    label="📊 Trạng Thái",
-                    lines=2,
+            with gr.Column(scale=1):
+                gr.HTML("""
+                <div class='glass-card'>
+                    <div class='card-title'>
+                        <span class='card-icon'>🔊</span>
+                        Output: Tiếng Anh
+                    </div>
+                </div>
+                """)
+                audio_output = gr.Audio(
+                    label="Phát âm tiếng Anh",
+                    type="filepath",
                     interactive=False,
-                    placeholder="Nhấn nút để bắt đầu dịch..."
+                    elem_classes=["audio-output"],
                 )
 
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("### 📝 Văn Bản Gốc (Tiếng Việt)")
-                        original_text = gr.Textbox(
-                            label="Transcript",
-                            lines=5,
-                            interactive=False,
-                            placeholder="Văn bản gốc sẽ hiện ở đây..."
-                        )
-                    
-                    with gr.Column():
-                        gr.Markdown("### 📝 Văn Bản Dịch (Tiếng Anh)")
-                        translated_text = gr.Textbox(
-                            label="Translation",
-                            lines=5,
-                            interactive=False,
-                            placeholder="Văn bản dịch sẽ hiện ở đây..."
-                        )
+        with gr.Row():
+            translate_button = gr.Button(
+                "🚀 Dịch & Phát Âm",
+                size="lg",
+                variant="primary",
+                elem_classes=["translate-btn"],
+            )
 
-                translate_button.click(
-                    fn=translate_audio,
-                    inputs=[audio_input],
-                    outputs=[original_text, translated_text, audio_output, status_box],
+        status_box = gr.Textbox(
+            label="📊 Trạng Thái",
+            lines=2,
+            interactive=False,
+            placeholder="Nhấn nút để bắt đầu dịch...",
+            elem_classes=["textbox-output"],
+        )
+
+        with gr.Row():
+            with gr.Column():
+                gr.HTML("""
+                <div class='glass-card'>
+                    <div class='card-title'>
+                        <span class='card-icon'>📝</span>
+                        Văn Bản Gốc (Tiếng Việt)
+                    </div>
+                </div>
+                """)
+                original_text = gr.Textbox(
+                    label="Transcript",
+                    lines=5,
+                    interactive=False,
+                    placeholder="Văn bản gốc sẽ hiện ở đây...",
+                    elem_classes=["textbox-output"],
                 )
 
-            # Tab 2: Information
-            with gr.TabItem("ℹ️ Thông Tin", id="tab_info"):
-                gr.Markdown("""
-                ## 🚀 Về Ứng Dụng
-                
-                **Vietnamese Speech-to-Speech Translator** là một ứng dụng dịch giọng nói real-time với:
-                
-                ### ✨ Tính Năng
-                - 🎤 **Ghi âm**: Nói tiếng Việt trực tiếp
-                - 🧠 **AI Dịch Thuật**: Sử dụng API Groq
-                - 🔊 **Phát Âm**: Nghe tiếng Anh được phát âm tự động
-                - ⚡ **Nhanh**: Dưới 5 giây toàn bộ quy trình
-                - 🖥️ **GPU Accelerated**: Sử dụng NVIDIA RTX 4050
-                
-                ### 🔧 Công Nghệ
-                - **STT**: faster-whisper (Model: large-v3-turbo)
-                - **LLM**: Groq LLM (Model: llama-3.3-70b-versatile)
-                - **TTS**: edge-tts (fallback) / Vienew (tùy chọn)
-                - **GUI**: Gradio
-                
-                ### 📊 Hiệu Suất
-                - STT (Whisper): ~0.3-0.5s ⚡
-                - Translation (Groq): ~1-2s
-                - TTS (Text-to-Speech): ~1-2s
-                - **Tổng cộng**: ~3-5s
-                
-                ### 📁 Cấu Trúc
-                ```
-                main.py              - Ứng dụng chính
-                setup_gpu.py          - Kiểm tra GPU
-                requirements.txt      - Dependencies
-                .env                  - API Key (bảo mật)
-                ```
+            with gr.Column():
+                gr.HTML("""
+                <div class='glass-card'>
+                    <div class='card-title'>
+                        <span class='card-icon'>🌍</span>
+                        Văn Bản Dịch (Tiếng Anh)
+                    </div>
+                </div>
                 """)
+                translated_text = gr.Textbox(
+                    label="Translation",
+                    lines=5,
+                    interactive=False,
+                    placeholder="Văn bản dịch sẽ hiện ở đây...",
+                    elem_classes=["textbox-output"],
+                )
 
-            # Tab 3: Settings
-            with gr.TabItem("⚙️ Cài Đặt", id="tab_settings"):
-                gr.Markdown("""
-                ## ⚙️ Cấu Hình
-                
-                ### 🔑 API Key
-                - **Status**: ✅ Đã cấu hình
-                - **Model**: llama-3.3-70b-versatile
-                - **Tệp**: `.env` (giữ bảo mật)
-                
-                ### 🖥️ GPU
-                - **Device**: NVIDIA RTX 4050
-                - **CUDA**: 12.7
-                - **PyTorch**: 2.5.1
-                - **Status**: ✅ Hoạt động
-                
-                ### 🎯 Chất Lượng
-                - **Ngôn Ngữ STT**: Tiếng Việt
-                - **Beam Size**: 1
-                - **VAD Filter**: Bật
-                - **Precision**: float16 (GPU) / int8 (CPU)
-                
-                ### 📚 Hỗ Trợ
-                Nếu gặp lỗi, hãy kiểm tra:
-                1. File `.env` có chứa API Key?
-                2. GPU có hoạt động? → Chạy `python setup_gpu.py`
-                3. Dependencies cài đủ? → Chạy `pip install -r requirements.txt`
-                """)
+        translate_button.click(
+            fn=translate_audio,
+            inputs=[audio_input],
+            outputs=[original_text, translated_text, audio_output, status_box],
+        )
+
+        # ===== Footer =====
+        gr.HTML("""
+        <div class='footer'>
+            Made with <span class='heart'>❤</span> · Dịch Giọng Nói Việt - Anh
+        </div>
+        """)
 
     return demo
 
