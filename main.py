@@ -6,6 +6,7 @@ import io
 import os
 import re
 import socket
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -17,6 +18,38 @@ import soundfile as sf
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Windows + aiohttp/edge-tts: ProactorEventLoop often prints harmless WinError 10054
+# when the remote host closes the socket first. Silence that known noise.
+if sys.platform == "win32":
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+
+        _orig_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+
+        def _quiet_connection_lost(self, exc):  # type: ignore[no-untyped-def]
+            try:
+                _orig_connection_lost(self, exc)
+            except (ConnectionResetError, ConnectionAbortedError):
+                pass
+            except OSError as err:
+                if getattr(err, "winerror", None) != 10054:
+                    raise
+
+        _ProactorBasePipeTransport._call_connection_lost = _quiet_connection_lost  # type: ignore[method-assign]
+    except Exception:
+        pass
+
+
+def _read_audio(source, sample_rate: Optional[int] = None) -> Tuple[np.ndarray, int]:
+    """Đọc audio thành mono float32, tùy chọn resample về sample_rate."""
+    data, sr = sf.read(source, dtype="float32")
+    if data.ndim > 1:
+        data = np.mean(data, axis=1)
+    if sample_rate and sr != sample_rate:
+        target_len = int(len(data) * sample_rate / sr)
+        data = np.interp(np.linspace(0, len(data) - 1, target_len), np.arange(len(data)), data).astype(np.float32)
+    return data, sr
 
 
 class AudioInputNode:
@@ -30,13 +63,7 @@ class AudioInputNode:
         if not path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        data, sr = sf.read(str(path), dtype="float32")
-        if data.ndim > 1:
-            data = np.mean(data, axis=1)
-        if sr != self.sample_rate:
-            target_len = int(len(data) * self.sample_rate / sr)
-            data = np.interp(np.linspace(0, len(data) - 1, target_len), np.arange(len(data)), data).astype(np.float32)
-
+        data, _ = _read_audio(str(path), self.sample_rate)
         buffer = io.BytesIO()
         sf.write(buffer, data, self.sample_rate, format="WAV")
         return buffer.getvalue(), self.sample_rate
@@ -73,10 +100,7 @@ class STTNode:
         if self.model is None:
             return "[STT unavailable: faster-whisper model could not be loaded.]"
         try:
-            buffer = io.BytesIO(audio_bytes)
-            audio_array, _ = sf.read(buffer, dtype="float32")
-            if audio_array.ndim > 1:
-                audio_array = np.mean(audio_array, axis=1)
+            audio_array, _ = _read_audio(io.BytesIO(audio_bytes))
             segments, _ = self.model.transcribe(audio_array, language="vi", beam_size=1, vad_filter=True)
             transcript = " ".join(segment.text.strip() for segment in segments if segment.text)
             return transcript.strip() or "[STT returned no speech.]"
@@ -126,7 +150,7 @@ class LLMNode:
     def _split_for_translation(self, text: str, max_chars: int = 1200) -> list[str]:
         if len(text) <= max_chars:
             return [text]
-        sentences = re.split(r"(?<=[.!?…])\s+|(?<=[;])\s+|\n+", text)
+        sentences = re.split(r"(?<=[.!?…;])\s+|\n+", text)
         if len(sentences) == 1:
             sentences = re.split(r"(?<=[,])\s+", text)
 
@@ -171,8 +195,7 @@ class LLMNode:
             {"role": "system", "content": "You are a professional Vietnamese to English translator. Output ONLY the translated English text."},
             {"role": "user", "content": prompt},
         ]
-        approx_out = max(256, min(4096, int(len(text.split()) * 3) + 256))
-        max_tokens = approx_out + 1024
+        max_tokens = min(8192, int(len(text.split()) * 3) + 1280)
 
         for attempt in range(2):
             try:
@@ -233,12 +256,25 @@ class VienewTTSWrapper:
             import edge_tts
 
             async def _run() -> bytes:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                    output_path = f.name
-                await edge_tts.Communicate(text, voice="en-US-AriaNeural").save(output_path)
-                return Path(output_path).read_bytes()
+                chunks: list[bytes] = []
+                communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
+                async for message in communicate.stream():
+                    if message["type"] == "audio":
+                        chunks.append(message["data"])
+                return b"".join(chunks)
 
-            return asyncio.run(_run()), "mp3"
+            # SelectorEventLoop avoids Proactor WinError 10054 on Windows.
+            loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(_run()), "mp3"
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                loop.close()
+                asyncio.set_event_loop(None)
         except Exception:
             return self._generate_placeholder_audio(), "wav"
 
@@ -260,10 +296,10 @@ class SpeechTranslationPipeline:
     def run(self, audio_path: Optional[str]) -> Tuple[str, str, Optional[str], str]:
         start_time = time.perf_counter()
         try:
-            audio_bytes, sample_rate = self.audio_node.prepare_audio(audio_path)
-            transcript = self.stt_node.transcribe(audio_bytes, sample_rate)
-            translation = self.llm_node.translate(transcript)
-            audio_out_bytes, audio_format = self.tts_node.synthesize(translation)
+            audio_bytes, sample_rate = self._timed("audio", lambda: self.audio_node.prepare_audio(audio_path))
+            transcript = self._timed("stt", lambda: self.stt_node.transcribe(audio_bytes, sample_rate))
+            translation = self._timed("llm", lambda: self.llm_node.translate(transcript))
+            audio_out_bytes, audio_format = self._timed("tts", lambda: self.tts_node.synthesize(translation))
 
             suffix = ".wav" if audio_format == "wav" else ".mp3"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
@@ -274,6 +310,12 @@ class SpeechTranslationPipeline:
             return transcript, translation, output_path, f"Completed in {elapsed:.2f}s"
         except Exception as exc:
             return "", f"[Pipeline error] {exc}", None, f"Failed: {exc}"
+
+    def _timed(self, name: str, fn) -> object:
+        start = time.perf_counter()
+        result = fn()
+        print(f"[{name.upper()}] completed in {time.perf_counter() - start:.2f}s")
+        return result
 
 
 def build_ui() -> gr.Blocks:
