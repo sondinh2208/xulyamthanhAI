@@ -1,0 +1,28 @@
+# Render Blueprint for Speech Translation App
+# https://render.com/docs/blueprint-spec
+# Dùng gói Free (512MB RAM) — model đã lượng tử hóa int8 nhỏ gọn.
+
+services:
+  - type: web
+    name: xuly-am-thanh
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      # Model Whisper base + int8 = chỉ ~70MB RAM, đủ chạy free tier 512MB.
+      # KHÔNG dùng "small" (~470MB) vì sẽ vượt giới hạn RAM 512MB.
+      - key: WHISPER_MODEL
+        value: base
+      - key: WHISPER_COMPUTE_TYPE
+        value: int8
+      # Render cung cấp PORT tự động; Gradio đọc từ biến này
+      - key: GRADIO_SHARE
+        value: "false"
+      # Đặt API key Groq ở Render Dashboard thay vì commit lên git
+      - key: GROQ_API_KEY
+        sync: false

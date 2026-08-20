@@ -6,3 +6,11 @@ __pycache__/
 
 # BỎ QUA FILE CHỨA API KEY (Cực kỳ quan trọng)
 .env
+
+# Bỏ qua model đã lượng tử hóa (quá nặng, cần tải lại khi deploy)
+models/
+*.bin
+*.safetensors
+
+# Cache Hugging Face trên Render
+.cache/

@@ -70,13 +70,11 @@ class AudioInputNode:
 
 
 def _default_whisper_model() -> str:
-    """Pick a Whisper size that fits the runtime (HF free Spaces = CPU)."""
+    """Pick a Whisper size that fits the runtime (Render 512MB CPU, HF Spaces, hoặc local GPU)."""
     override = os.getenv("WHISPER_MODEL")
     if override:
         return override
-    # Hugging Face Spaces sets SPACE_ID; free tier is CPU-only and slow for large models.
-    if os.getenv("SPACE_ID") or os.getenv("SYSTEM") == "spaces":
-        return "small"
+    # Máy local có GPU → model lớn chất lượng cao nhất.
     if importlib.util.find_spec("torch") is not None:
         try:
             import torch
@@ -85,14 +83,20 @@ def _default_whisper_model() -> str:
                 return "large-v3-turbo"
         except Exception:
             pass
-    return "small"
+    # Render free tier chỉ có CPU (RAM 512MB) => model base int8 (~70-100MB RAM):
+    # an toàn, không bị OOM. KHÔNG dùng "small" (~470MB) vì vượt giới hạn 512MB.
+    return "base"
 
 
 class STTNode:
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = model_name or _default_whisper_model()
         self.device = "cuda" if self._cuda_available() else "cpu"
-        self.compute_type = "float16" if self.device == "cuda" else "int8"
+        override_type = os.getenv("WHISPER_COMPUTE_TYPE")
+        if override_type:
+            self.compute_type = override_type
+        else:
+            self.compute_type = "float16" if self.device == "cuda" else "int8"
         print(f"[STT] Using {self.device.upper()} ({self.compute_type})")
         self.model = None
         self._load_model()
@@ -100,8 +104,11 @@ class STTNode:
     def _cuda_available(self) -> bool:
         if importlib.util.find_spec("torch") is None:
             return False
-        import torch
-        return torch.cuda.is_available()
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except Exception:
+            return False
 
     def _load_model(self):
         if importlib.util.find_spec("faster_whisper") is None:
@@ -109,7 +116,7 @@ class STTNode:
             return
         try:
             from faster_whisper import WhisperModel
-            print(f"[STT] Loading model '{self.model_name}'...")
+            print(f"[STT] Loading model '{self.model_name}' (compute_type={self.compute_type})...")
             self.model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type, download_root=None)
         except Exception as exc:
             print(f"[STT] Model load failed: {exc}")
