@@ -1,9 +1,11 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
-# Cài đặt ffmpeg và các thư viện hệ thống cần thiết
+# Cài đặt ffmpeg, espeak (pour Kokoro-TTS) và các thư viện hệ thống cần thiết
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     git \
+    espeak \
+    libespeak1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Thiết lập thư mục làm việc

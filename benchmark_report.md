@@ -20,7 +20,7 @@
 
 1. **Nhận diện giọng nói (STT):** `faster-whisper` với model `large-v3-turbo`, chạy local, `float16` qua CUDA.
 2. **Dịch thuật văn bản (LLM):** Chuyển từ Gemini API sang **Groq API** với model `llama-3.1-8b-instant`, `temperature=0`, `max_tokens=60`.
-3. **Tổng hợp giọng nói (TTS):** Sử dụng fallback `edge-tts` với giọng `en-US-AriaNeural`.
+3. **Tổng hợp giọng nói (TTS):** Sử dụng **Kokoro-TTS** local với giọng `af_heart` (chạy 100% local, không cần API).
 
 ---
 
@@ -31,7 +31,7 @@
 | Giao tiếp UI (Audio) | 0.01s | 0.01s | 0% | Độ trễ truyền tải dữ liệu cực thấp |
 | STT (Faster-Whisper) | 1.26s | 1.26s | 0% | RTX 4050 xử lý tốt file audio dài |
 | LLM (Translation) | 13.12s | ~0.30s | +4273% | Loại bỏ hoàn toàn giới hạn hàng đợi và Rate Limit 429 |
-| TTS (Edge-TTS) | 1.36s | 1.36s | 0% | Ổn định qua luồng mạng dự phòng |
+| TTS (Kokoro-TTS) | 1.36s | ~0.5-1.0s | +36% | Chạy 100% local, không cần API, không độ trễ mạng |
 | **Tổng độ trễ** | **15.77s** | **~2.93s** | **+438%** | Hiệu năng tổng thể cải thiện mạnh |
 
 ---

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import io
 import os
 import re
-import socket
 import sys
 import tempfile
 import time
@@ -18,27 +16,6 @@ import soundfile as sf
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# Windows + aiohttp/edge-tts: ProactorEventLoop often prints harmless WinError 10054
-# when the remote host closes the socket first. Silence that known noise.
-if sys.platform == "win32":
-    try:
-        from asyncio.proactor_events import _ProactorBasePipeTransport
-
-        _orig_connection_lost = _ProactorBasePipeTransport._call_connection_lost
-
-        def _quiet_connection_lost(self, exc):  # type: ignore[no-untyped-def]
-            try:
-                _orig_connection_lost(self, exc)
-            except (ConnectionResetError, ConnectionAbortedError):
-                pass
-            except OSError as err:
-                if getattr(err, "winerror", None) != 10054:
-                    raise
-
-        _ProactorBasePipeTransport._call_connection_lost = _quiet_connection_lost  # type: ignore[method-assign]
-    except Exception:
-        pass
 
 
 def _read_audio(source, sample_rate: Optional[int] = None) -> Tuple[np.ndarray, int]:
@@ -69,34 +46,11 @@ class AudioInputNode:
         return buffer.getvalue(), self.sample_rate
 
 
-def _default_whisper_model() -> str:
-    """Pick a Whisper size that fits the runtime (Render 512MB CPU, HF Spaces, hoặc local GPU)."""
-    override = os.getenv("WHISPER_MODEL")
-    if override:
-        return override
-    # Máy local có GPU → model lớn chất lượng cao nhất.
-    if importlib.util.find_spec("torch") is not None:
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                return "large-v3-turbo"
-        except Exception:
-            pass
-    # Render free tier chỉ có CPU (RAM 512MB) => model base int8 (~70-100MB RAM):
-    # an toàn, không bị OOM. KHÔNG dùng "small" (~470MB) vì vượt giới hạn 512MB.
-    return "base"
-
-
 class STTNode:
-    def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or _default_whisper_model()
+    def __init__(self, model_name: str = "large-v3-turbo"):
+        self.model_name = model_name
         self.device = "cuda" if self._cuda_available() else "cpu"
-        override_type = os.getenv("WHISPER_COMPUTE_TYPE")
-        if override_type:
-            self.compute_type = override_type
-        else:
-            self.compute_type = "float16" if self.device == "cuda" else "int8"
+        self.compute_type = "float16" if self.device == "cuda" else "int8"
         print(f"[STT] Using {self.device.upper()} ({self.compute_type})")
         self.model = None
         self._load_model()
@@ -104,11 +58,8 @@ class STTNode:
     def _cuda_available(self) -> bool:
         if importlib.util.find_spec("torch") is None:
             return False
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except Exception:
-            return False
+        import torch
+        return torch.cuda.is_available()
 
     def _load_model(self):
         if importlib.util.find_spec("faster_whisper") is None:
@@ -116,7 +67,7 @@ class STTNode:
             return
         try:
             from faster_whisper import WhisperModel
-            print(f"[STT] Loading model '{self.model_name}' (compute_type={self.compute_type})...")
+            print(f"[STT] Loading model '{self.model_name}'...")
             self.model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type, download_root=None)
         except Exception as exc:
             print(f"[STT] Model load failed: {exc}")
@@ -247,61 +198,60 @@ class LLMNode:
 
 
 class VienewTTSWrapper:
+    """Text-to-Speech wrapper using Kokoro-TTS (local, no API required)."""
+
+    # Kokoro-TTS sample rate
+    SAMPLE_RATE = 24000
+
     def __init__(self):
         self.backend = self._select_backend()
 
     def _select_backend(self):
-        if importlib.util.find_spec("vienew") is not None:
+        if importlib.util.find_spec("kokoro") is not None:
             try:
-                from vienew import TTSClient  # type: ignore
-                print("[TTS] Using Vienew backend.")
-                return TTSClient()
-            except Exception:
-                pass
-        if importlib.util.find_spec("edge_tts") is not None:
-            print("[TTS] Using edge-tts fallback backend.")
-            return "edge_tts"
+                from kokoro import KPipeline
+                print("[TTS] Using Kokoro-TTS local backend.")
+                # 'a' = American English (the pipeline translates Vietnamese -> English)
+                self._pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+                return "kokoro"
+            except Exception as exc:
+                print(f"[TTS] Kokoro-TTS initialization failed: {exc}")
         print("[TTS] No TTS backend installed; generating placeholder audio.")
         return None
 
     def synthesize(self, text: str) -> Tuple[bytes, str]:
         if self.backend is None:
             return self._generate_placeholder_audio(), "wav"
-        if self.backend == "edge_tts":
-            return self._synthesize_with_edge_tts(text)
+        if self.backend == "kokoro":
+            return self._synthesize_with_kokoro(text)
+        return self._generate_placeholder_audio(), "wav"
+
+    def _synthesize_with_kokoro(self, text: str) -> Tuple[bytes, str]:
         try:
-            audio = self.backend.speak(text)
-            if isinstance(audio, (bytes, bytearray)):
-                return bytes(audio), "wav"
-        except Exception:
-            pass
-        return self._synthesize_with_edge_tts(text)
+            import torch
 
-    def _synthesize_with_edge_tts(self, text: str) -> Tuple[bytes, str]:
-        try:
-            import edge_tts
+            # Use a natural English voice (af_heart is a warm female voice)
+            voice = "af_heart"
+            generator = self._pipeline(text, voice=voice, speed=1.0)
 
-            async def _run() -> bytes:
-                chunks: list[bytes] = []
-                communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
-                async for message in communicate.stream():
-                    if message["type"] == "audio":
-                        chunks.append(message["data"])
-                return b"".join(chunks)
+            audio_chunks = []
+            for result in generator:
+                if result.audio is not None:
+                    audio_chunks.append(result.audio)
 
-            # SelectorEventLoop avoids Proactor WinError 10054 on Windows.
-            loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                return loop.run_until_complete(_run()), "mp3"
-            finally:
-                try:
-                    loop.run_until_complete(loop.shutdown_asyncgens())
-                except Exception:
-                    pass
-                loop.close()
-                asyncio.set_event_loop(None)
-        except Exception:
+            if not audio_chunks:
+                return self._generate_placeholder_audio(), "wav"
+
+            # Concatenate all audio chunks
+            full_audio = torch.cat(audio_chunks) if len(audio_chunks) > 1 else audio_chunks[0]
+            audio_np = full_audio.numpy()
+
+            # Write as WAV
+            buffer = io.BytesIO()
+            sf.write(buffer, audio_np, self.SAMPLE_RATE, format="WAV")
+            return buffer.getvalue(), "wav"
+        except Exception as exc:
+            print(f"[TTS] Kokoro-TTS synthesis failed: {exc}")
             return self._generate_placeholder_audio(), "wav"
 
     def _generate_placeholder_audio(self) -> bytes:
@@ -480,17 +430,10 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
-demo = build_ui()
-
-
 if __name__ == "__main__":
+    demo = build_ui()
     port = int(os.environ.get("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
-    # HF Spaces already exposes a public URL — do not use Gradio share tunnels there.
-    on_spaces = bool(os.getenv("SPACE_ID") or os.getenv("SYSTEM") == "spaces")
-    # Local default: public Gradio share so the app is reachable on the web without HF PRO.
-    share_env = os.getenv("GRADIO_SHARE", "true" if not on_spaces else "false").lower()
     demo.launch(
         server_name="0.0.0.0",
         server_port=port,
-        share=(not on_spaces) and share_env in {"1", "true", "yes"},
-    )
+        share=True)
