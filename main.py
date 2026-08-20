@@ -456,9 +456,8 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     demo = build_ui()
-    # Render tự động cấp port qua biến môi trường PORT
     port = int(os.environ.get("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
     demo.launch(
         server_name="0.0.0.0",
         server_port=port,
-        share=False)
+        share=True)
