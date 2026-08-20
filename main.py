@@ -456,13 +456,9 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     demo = build_ui()
-    port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", port))
-    except OSError:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-    print(f"Open your browser at: http://127.0.0.1:{port}")
-    demo.launch(server_name="127.0.0.1", server_port=port, share=False)
+    # Render tự động cấp port qua biến môi trường PORT
+    port = int(os.environ.get("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False)
