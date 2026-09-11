@@ -4,7 +4,6 @@ import importlib.util
 import io
 import os
 import re
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -20,13 +19,13 @@ load_dotenv()
 
 def _read_audio(source, sample_rate: Optional[int] = None) -> Tuple[np.ndarray, int]:
     """Đọc audio thành mono float32, tùy chọn resample về sample_rate."""
-    data, sr = sf.read(source, dtype="float32")
+    data, source_rate = sf.read(source, dtype="float32")
     if data.ndim > 1:
         data = np.mean(data, axis=1)
-    if sample_rate and sr != sample_rate:
-        target_len = int(len(data) * sample_rate / sr)
+    if sample_rate and source_rate != sample_rate:
+        target_len = int(len(data) * sample_rate / source_rate)
         data = np.interp(np.linspace(0, len(data) - 1, target_len), np.arange(len(data)), data).astype(np.float32)
-    return data, sr
+    return data, source_rate
 
 
 class AudioInputNode:
@@ -41,18 +40,18 @@ class AudioInputNode:
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
         data, _ = _read_audio(str(path), self.sample_rate)
-        buffer = io.BytesIO()
-        sf.write(buffer, data, self.sample_rate, format="WAV")
-        return buffer.getvalue(), self.sample_rate
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, data, self.sample_rate, format="WAV")
+        return wav_buffer.getvalue(), self.sample_rate
 
 
-class STTNode:
+class SpeechToTextNode:
     def __init__(self, model_name: str = "large-v3-turbo"):
         self.model_name = model_name
         self.device = "cuda" if self._cuda_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
         print(f"[STT] Using {self.device.upper()} ({self.compute_type})")
-        self.model = None
+        self.whisper_model = None
         self._load_model()
 
     def _cuda_available(self) -> bool:
@@ -68,24 +67,24 @@ class STTNode:
         try:
             from faster_whisper import WhisperModel
             print(f"[STT] Loading model '{self.model_name}'...")
-            self.model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type, download_root=None)
+            self.whisper_model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type, download_root=None)
         except Exception as exc:
             print(f"[STT] Model load failed: {exc}")
-            self.model = None
+            self.whisper_model = None
 
     def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
-        if self.model is None:
+        if self.whisper_model is None:
             return "[STT unavailable: faster-whisper model could not be loaded.]"
         try:
             audio_array, _ = _read_audio(io.BytesIO(audio_bytes))
-            segments, _ = self.model.transcribe(audio_array, language="vi", beam_size=1, vad_filter=True)
+            segments, _ = self.whisper_model.transcribe(audio_array, language="vi", beam_size=1, vad_filter=True)
             transcript = " ".join(segment.text.strip() for segment in segments if segment.text)
             return transcript.strip() or "[STT returned no speech.]"
         except Exception as exc:
             return f"[STT error: {exc}]"
 
 
-class LLMNode:
+class TranslationNode:
     def __init__(self, model_name: str = "openai/gpt-oss-20b"):
         self.model_name = model_name
         self.client = None
@@ -131,36 +130,36 @@ class LLMNode:
         if len(sentences) == 1:
             sentences = re.split(r"(?<=[,])\s+", text)
 
-        chunks, current = [], ""
+        chunks, current_chunk = [], ""
         for sentence in sentences:
             sentence = sentence.strip()
             if not sentence:
                 continue
-            if not current or len(current) + 1 + len(sentence) <= max_chars:
-                current = f"{current} {sentence}".strip()
+            if not current_chunk or len(current_chunk) + 1 + len(sentence) <= max_chars:
+                current_chunk = f"{current_chunk} {sentence}".strip()
             else:
-                chunks.append(current)
-                current = sentence
-        if current:
-            chunks.append(current)
+                chunks.append(current_chunk)
+                current_chunk = sentence
+        if current_chunk:
+            chunks.append(current_chunk)
 
-        final = []
+        result_chunks = []
         for chunk in chunks:
             if len(chunk) <= max_chars:
-                final.append(chunk)
+                result_chunks.append(chunk)
                 continue
-            buf, size = [], 0
+            words, char_count = [], 0
             for word in chunk.split():
-                add = len(word) + (1 if buf else 0)
-                if buf and size + add > max_chars:
-                    final.append(" ".join(buf))
-                    buf, size = [word], len(word)
+                added_chars = len(word) + (1 if words else 0)
+                if words and char_count + added_chars > max_chars:
+                    result_chunks.append(" ".join(words))
+                    words, char_count = [word], len(word)
                 else:
-                    buf.append(word)
-                    size += add
-            if buf:
-                final.append(" ".join(buf))
-        return final or [text]
+                    words.append(word)
+                    char_count += added_chars
+            if words:
+                result_chunks.append(" ".join(words))
+        return result_chunks or [text]
 
     def _translate_chunk(self, text: str) -> str:
         prompt = (
@@ -197,7 +196,7 @@ class LLMNode:
                 return f"[ERROR] Translation failed: {str(exc)}"
 
 
-class VienewTTSWrapper:
+class TextToSpeechNode:
     """Text-to-Speech wrapper using Kokoro-TTS (local, no API required)."""
 
     # Kokoro-TTS sample rate
@@ -220,8 +219,6 @@ class VienewTTSWrapper:
         return None
 
     def synthesize(self, text: str) -> Tuple[bytes, str]:
-        if self.backend is None:
-            return self._generate_placeholder_audio(), "wav"
         if self.backend == "kokoro":
             return self._synthesize_with_kokoro(text)
         return self._generate_placeholder_audio(), "wav"
@@ -247,50 +244,50 @@ class VienewTTSWrapper:
             audio_np = full_audio.numpy()
 
             # Write as WAV
-            buffer = io.BytesIO()
-            sf.write(buffer, audio_np, self.SAMPLE_RATE, format="WAV")
-            return buffer.getvalue(), "wav"
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np, self.SAMPLE_RATE, format="WAV")
+            return wav_buffer.getvalue(), "wav"
         except Exception as exc:
             print(f"[TTS] Kokoro-TTS synthesis failed: {exc}")
             return self._generate_placeholder_audio(), "wav"
 
     def _generate_placeholder_audio(self) -> bytes:
-        sr = 22050
-        audio = 0.3 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.8, int(sr * 0.8), endpoint=False)).astype(np.float32)
-        buffer = io.BytesIO()
-        sf.write(buffer, audio, sr, format="WAV")
-        return buffer.getvalue()
+        sample_rate = 22050
+        placeholder_audio = 0.3 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.8, int(sample_rate * 0.8), endpoint=False)).astype(np.float32)
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, placeholder_audio, sample_rate, format="WAV")
+        return wav_buffer.getvalue()
 
 
 class SpeechTranslationPipeline:
     def __init__(self):
-        self.audio_node = AudioInputNode()
-        self.stt_node = STTNode()
-        self.llm_node = LLMNode()
-        self.tts_node = VienewTTSWrapper()
+        self.audio_input_node = AudioInputNode()
+        self.speech_to_text_node = SpeechToTextNode()
+        self.translation_node = TranslationNode()
+        self.text_to_speech_node = TextToSpeechNode()
 
     def run(self, audio_path: Optional[str]) -> Tuple[str, str, Optional[str], str]:
         start_time = time.perf_counter()
         try:
-            audio_bytes, sample_rate = self._timed("audio", lambda: self.audio_node.prepare_audio(audio_path))
-            transcript = self._timed("stt", lambda: self.stt_node.transcribe(audio_bytes, sample_rate))
-            translation = self._timed("llm", lambda: self.llm_node.translate(transcript))
-            audio_out_bytes, audio_format = self._timed("tts", lambda: self.tts_node.synthesize(translation))
+            audio_bytes, sample_rate = self._run_timed_step("audio", lambda: self.audio_input_node.prepare_audio(audio_path))
+            transcript = self._run_timed_step("stt", lambda: self.speech_to_text_node.transcribe(audio_bytes, sample_rate))
+            translation = self._run_timed_step("llm", lambda: self.translation_node.translate(transcript))
+            audio_out_bytes, audio_format = self._run_timed_step("tts", lambda: self.text_to_speech_node.synthesize(translation))
 
             suffix = ".wav" if audio_format == "wav" else ".mp3"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                f.write(audio_out_bytes)
-                output_path = f.name
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as output_file:
+                output_file.write(audio_out_bytes)
+                output_path = output_file.name
 
             elapsed = time.perf_counter() - start_time
             return transcript, translation, output_path, f"Completed in {elapsed:.2f}s"
         except Exception as exc:
             return "", f"[Pipeline error] {exc}", None, f"Failed: {exc}"
 
-    def _timed(self, name: str, fn) -> object:
-        start = time.perf_counter()
-        result = fn()
-        print(f"[{name.upper()}] completed in {time.perf_counter() - start:.2f}s")
+    def _run_timed_step(self, name: str, callback) -> object:
+        start_time = time.perf_counter()
+        result = callback()
+        print(f"[{name.upper()}] completed in {time.perf_counter() - start_time:.2f}s")
         return result
 
 

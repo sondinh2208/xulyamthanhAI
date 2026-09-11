@@ -31,7 +31,7 @@ def check_torch_cuda():
         import torch
 
         if torch.cuda.is_available():
-            print(f"✅ PyTorch CUDA is available")
+            print("✅ PyTorch CUDA is available")
             print(f"   CUDA version: {torch.version.cuda}")
             print(f"   Device count: {torch.cuda.device_count()}")
             print(f"   Current device: {torch.cuda.get_device_name(0)}")
