@@ -7,6 +7,8 @@ Checks CUDA availability and provides installation instructions
 import subprocess
 import sys
 
+SEPARATOR = "=" * 70
+
 
 def check_nvidia_gpu():
     """Check if NVIDIA GPU is available."""
@@ -71,9 +73,9 @@ def check_faster_whisper():
 
 def print_installation_instructions():
     """Print installation instructions for GPU support."""
-    print("\n" + "=" * 70)
+    print("\n" + SEPARATOR)
     print("INSTALLATION INSTRUCTIONS")
-    print("=" * 70)
+    print(SEPARATOR)
 
     print("\n1. Install NVIDIA CUDA Toolkit (if not already installed):")
     print("   - Download from: https://developer.nvidia.com/cuda-downloads")
@@ -94,13 +96,13 @@ def print_installation_instructions():
     print("\n5. Install other dependencies:")
     print("   pip install -r requirements.txt")
 
-    print("\n" + "=" * 70)
+    print("\n" + SEPARATOR)
 
 
 def main():
-    print("=" * 70)
+    print(SEPARATOR)
     print("GPU SETUP VERIFICATION FOR SPEECH TRANSLATION PIPELINE")
-    print("=" * 70 + "\n")
+    print(SEPARATOR + "\n")
 
     gpu_available = check_nvidia_gpu()
     print()
