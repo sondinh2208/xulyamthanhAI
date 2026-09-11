@@ -314,9 +314,6 @@ def build_ui() -> gr.Blocks:
     .glass-card:hover { border-color:rgba(139,92,246,.4); box-shadow:0 12px 40px rgba(139,92,246,.12); }
     .card-title { display:flex; align-items:center; gap:10px; font-size:1.05em; font-weight:700; color:var(--text-primary); }
     .card-title .card-icon { width:36px; height:36px; display:flex; align-items:center; justify-content:center; border-radius:10px; background:linear-gradient(135deg,rgba(139,92,246,.3),rgba(6,182,212,.3)); font-size:1.1em; }
-    .translate-btn { background:var(--gradient-primary) !important; border:none !important; color:white !important; font-weight:700 !important; font-size:1.1em !important; padding:14px 32px !important; border-radius:14px !important; box-shadow:0 4px 20px rgba(139,92,246,.35) !important; transition:all .3s ease !important; letter-spacing:.3px; }
-    .translate-btn:hover { transform:translateY(-2px) !important; box-shadow:0 8px 32px rgba(139,92,246,.5) !important; filter:brightness(1.1); }
-    .translate-btn:active { transform:translateY(0) !important; }
     .textbox-output textarea { background:rgba(15,23,42,.6) !important; border:1px solid var(--glass-border) !important; border-radius:12px !important; color:var(--text-primary) !important; font-size:1em !important; line-height:1.6 !important; }
     .textbox-output textarea:focus { border-color:var(--accent) !important; box-shadow:0 0 0 3px rgba(139,92,246,.15) !important; }
     .audio-input, .audio-output { border-radius:12px !important; overflow:hidden; }
@@ -373,16 +370,15 @@ def build_ui() -> gr.Blocks:
                     label="Phát âm tiếng Anh",
                     type="filepath",
                     interactive=False,
+                    autoplay=True,
                     elem_classes=["audio-output"],
                 )
-
-        translate_button = gr.Button("🚀 Dịch & Phát Âm", size="lg", variant="primary", elem_classes=["translate-btn"])
 
         status_box = gr.Textbox(
             label="📊 Trạng Thái",
             lines=2,
             interactive=False,
-            placeholder="Nhấn nút để bắt đầu dịch...",
+            placeholder="🎧 Chờ ghi âm hoặc tải tệp âm thanh — quá trình dịch sẽ chạy tự động...",
             elem_classes=["textbox-output"],
         )
 
@@ -415,7 +411,13 @@ def build_ui() -> gr.Blocks:
                     elem_classes=["textbox-output"],
                 )
 
-        translate_button.click(
+        # Tự động kích hoạt pipeline ngay khi (1) dừng ghi âm micro hoặc (2) tải tệp âm thanh lên
+        audio_input.stop_recording(
+            fn=translate_audio,
+            inputs=[audio_input],
+            outputs=[original_text, translated_text, audio_output, status_box],
+        )
+        audio_input.upload(
             fn=translate_audio,
             inputs=[audio_input],
             outputs=[original_text, translated_text, audio_output, status_box],
