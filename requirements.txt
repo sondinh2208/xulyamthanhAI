@@ -5,6 +5,7 @@ python-dotenv>=1.0.0
 faster-whisper>=1.0.0
 groq>=0.4.0
 kokoro>=0.9.4
+pyngrok>=7.0.0
 # PyTorch with CUDA 12.1 support (for GPU acceleration)
 # To install: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 # For CPU-only: pip install torch torchvision torchaudio

@@ -13,9 +13,14 @@ load_dotenv()
 
 # ------------------------------------------------ App / server
 APP_TITLE = "Dịch Giọng Nói Việt - Anh"  # Gradio window title
-SERVER_NAME = "0.0.0.0"                  # listen on every network interface
-DEFAULT_SERVER_PORT = 7860               # fallback port (host may set $PORT)
-SHARE_LINK = True                        # create a temporary public link
+SERVER_NAME = "127.0.0.1"                # local only — public access goes through the ngrok tunnel
+DEFAULT_SERVER_PORT = 7860               # fixed local port
+SHARE_LINK = False                       # Gradio's share=True is fully replaced by pyngrok
+
+# ------------------------------------------------ Ngrok Tunnel
+NGROK_ENABLED = True                     # auto-open a public ngrok tunnel with the app
+NGROK_PORT = DEFAULT_SERVER_PORT         # tunnel target: http://127.0.0.1:7860
+NGROK_AUTHTOKEN_ENV = "NGROK_AUTHTOKEN"  # env var (set in .env) holding the ngrok authtoken
 
 # ----------------------------------------------------- Audio
 AUDIO_SAMPLE_RATE = 16000       # Whisper works best with 16 kHz mono audio
